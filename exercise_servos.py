@@ -6,7 +6,7 @@ import hid_compat
 import xarm
 
 # Small, safe motion
-DELTA_DEG = 120.0
+DELTA_DEG = 70.0
 DURATION_MS = 800
 PAUSE_SEC = (DURATION_MS / 1000.0) + 0.2
 

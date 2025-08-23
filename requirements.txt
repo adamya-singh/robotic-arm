@@ -4,3 +4,4 @@ numpy
 gymnasium
 matplotlib
 stable-baselines3
+fastapi

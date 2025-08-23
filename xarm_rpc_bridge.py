@@ -32,8 +32,9 @@ from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSock
 from fastapi.responses import JSONResponse
 from fastapi.websockets import WebSocketState
 from fastapi.concurrency import run_in_threadpool
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, field_validator
 import uvicorn
+import hid_compat
 
 # --- Hardware lib ---
 try:
@@ -86,9 +87,9 @@ class ServoLimit(BaseModel):
     max_rate_deg_s: float = Field(default=DEFAULT_MAX_RATE_DEG_S, gt=0)
     tolerance_deg: float = Field(default=DEFAULT_TOLERANCE_DEG, ge=0)
 
-    @validator("max_deg")
-    def _order(cls, v, values):
-        if "min_deg" in values and v <= values["min_deg"]:
+    @field_validator("max_deg")
+    def _order(cls, v, info):
+        if "min_deg" in info.data and v <= info.data["min_deg"]:
             raise ValueError("max_deg must be greater than min_deg")
         return v
 
@@ -479,4 +480,4 @@ def _parse_cli():
 if __name__ == "__main__":
     args = _parse_cli()
     # Bind to LAN; rely on firewall + token/IP allow for access control
-    uvicorn.run("bridge:app", host=args.host, port=args.port, reload=False)
+    uvicorn.run(app, host=args.host, port=args.port, reload=False)
