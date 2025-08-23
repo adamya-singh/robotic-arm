@@ -5,7 +5,7 @@ import time
 import xarm
 
 # Small, safe motion
-DELTA_DEG = 10.0
+DELTA_DEG = 120.0
 DURATION_MS = 800
 PAUSE_SEC = (DURATION_MS / 1000.0) + 0.2
 
@@ -43,10 +43,18 @@ def main():
             # Go +DELTA
             arm.setPosition(sid, DELTA_DEG, duration=DURATION_MS, wait=False)
             time.sleep(PAUSE_SEC)
+            
+            # Read arm data after moving to +DELTA
+            print(f"\n--- After moving servo {sid} to +{DELTA_DEG}° ---")
+            read_all_arm_data(arm)
 
             # Return to 0°
             arm.setPosition(sid, 0.0, duration=DURATION_MS, wait=False)
             time.sleep(PAUSE_SEC)
+            
+            # Read arm data after returning to 0°
+            print(f"\n--- After returning servo {sid} to 0° ---")
+            read_all_arm_data(arm)
 
             print(f"Servo {sid} moved +{DELTA_DEG}° and back.")
         except Exception as e:
