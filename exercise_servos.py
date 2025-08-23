@@ -2,6 +2,7 @@
 # File: exercise_servos_writeonly.py
 # pip install xarm
 import time
+import hid_compat
 import xarm
 
 # Small, safe motion

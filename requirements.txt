@@ -1,5 +1,6 @@
+hid
+xarm
 numpy
-time
 gymnasium
 matplotlib
 stable-baselines3
