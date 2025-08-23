@@ -171,6 +171,20 @@ class StepResp(BaseModel):
     t_pi: int
 
 
+class MultiStepReq(BaseModel):
+    # [[servo_id, delta_deg], ...]
+    servo_deltas: List[List[Union[int, float]]]
+    duration_ms: int = Field(ge=1)
+    readback: bool = True
+
+
+class MultiStepResp(BaseModel):
+    # Maps of servo_id (as string) -> values
+    angles_deg: Dict[str, float]
+    clipped: Dict[str, bool]
+    t_pi: int
+
+
 class LimitsUpdateReq(BaseModel):
     limits: Dict[str, ServoLimit]
 
@@ -248,6 +262,39 @@ async def _set_position_safe(servo_id: int, target_deg: float, duration_ms: int)
         await run_in_threadpool(ARM.setPosition, int(servo_id), float(safe_target), duration_ms, False)
 
 
+async def _set_positions_multi_safe(servo_positions: List[List[Union[int, float]]], duration_ms: int) -> Dict[str, bool]:
+    """
+    Apply per-servo safety and execute a simultaneous multi-servo move.
+    Returns a map of servo_id (str) -> clipped flag.
+    """
+    if not servo_positions:
+        raise HTTPException(status_code=400, detail="No servo positions provided")
+
+    safe_positions: List[List[Union[int, float]]] = []
+    clipped_map: Dict[str, bool] = {}
+
+    for idx, pair in enumerate(servo_positions):
+        if (not isinstance(pair, list)) or len(pair) != 2:
+            raise HTTPException(status_code=400, detail=f"Invalid entry at index {idx}: expected [servo_id, deg]")
+        try:
+            servo_id = int(pair[0])
+            target_deg = float(pair[1])
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail=f"Invalid servo_id/deg at index {idx}: {pair}")
+
+        if servo_id not in SERVO_LIMITS_DEG:
+            raise HTTPException(status_code=400, detail=f"Unknown servo {servo_id}")
+
+        safe_target, clipped = await _enforce_motion_limits(servo_id, target_deg, duration_ms)
+        safe_positions.append([int(servo_id), float(safe_target)])
+        clipped_map[str(servo_id)] = bool(clipped)
+
+    async with xarm_lock:
+        await run_in_threadpool(ARM.setPosition, safe_positions, duration=int(duration_ms), wait=False)
+
+    return clipped_map
+
+
 async def _snapshot() -> TelemetrySnapshot:
     positions: Dict[str, Optional[float]] = {}
     temps: Dict[str, Optional[float]] = {}
@@ -299,7 +346,14 @@ async def _invoke_allowlisted(req: InvokeReq) -> Any:
 
     # Intercept setPosition for safety clamp
     if req.method == "setPosition":
-        # Expect: (servo_id, deg, duration=..., wait=False)
+        # Multi-servo form: first arg is a list (e.g., [[sid1, deg1], [sid2, deg2], ...])
+        if len(req.args) >= 1 and isinstance(req.args[0], list):
+            positions = req.args[0]
+            duration_ms = int(req.kwargs.pop("duration", req.kwargs.pop("duration_ms", 200)))
+            await _set_positions_multi_safe(positions, duration_ms)
+            return "ok"
+
+        # Single-servo form: (servo_id, deg, duration=..., wait=False)
         if len(req.args) < 2 and "servo_id" not in req.kwargs:
             raise HTTPException(status_code=400, detail="setPosition requires servo_id and deg")
         # Extract args with defaults
@@ -377,6 +431,69 @@ async def rpc_step(req: StepReq):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Step error: {e}")
+
+
+@app.post("/rpc/multi_step", response_model=MultiStepResp, dependencies=[Depends(auth_guard)])
+async def rpc_multi_step(req: MultiStepReq):
+    """
+    Simultaneous multi-servo step:
+      - read currents for each servo
+      - compute targets = current + delta for each
+      - clamp per-servo (bounds + rate)
+      - single multi-servo setPosition(wait=False)
+      - sleep duration_ms (server-side)
+      - per-servo readback (optional)
+    """
+    try:
+        if not req.servo_deltas:
+            raise HTTPException(status_code=400, detail="servo_deltas cannot be empty")
+
+        targets: List[List[Union[int, float]]] = []
+        clipped_map: Dict[str, bool] = {}
+
+        # Compute safe targets per servo
+        for idx, pair in enumerate(req.servo_deltas):
+            if (not isinstance(pair, list)) or len(pair) != 2:
+                raise HTTPException(status_code=400, detail=f"Invalid entry at index {idx}: expected [servo_id, delta_deg]")
+            try:
+                sid = int(pair[0])
+                delta = float(pair[1])
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400, detail=f"Invalid servo_id/delta at index {idx}: {pair}")
+
+            if sid not in SERVO_LIMITS_DEG:
+                raise HTTPException(status_code=400, detail=f"Unknown servo {sid}")
+
+            curr = await _read_angle_deg(sid)
+            desired = curr + delta
+            safe_target, clipped = await _enforce_motion_limits(sid, desired, req.duration_ms)
+            targets.append([int(sid), float(safe_target)])
+            clipped_map[str(sid)] = bool(clipped)
+
+        # Execute simultaneous move
+        async with xarm_lock:
+            await run_in_threadpool(ARM.setPosition, targets, duration=int(req.duration_ms), wait=False)
+
+        # Server-owned timing
+        await asyncio.sleep(max(req.duration_ms, 1) / 1000.0)
+
+        # Readback
+        angles: Dict[str, float] = {}
+        if req.readback:
+            for pair in targets:
+                sid = int(pair[0])
+                angle = await _read_angle_deg(sid)
+                angles[str(sid)] = float(angle)
+        else:
+            for pair in targets:
+                sid = int(pair[0])
+                angles[str(sid)] = float(pair[1])
+
+        return MultiStepResp(angles_deg=angles, clipped=clipped_map, t_pi=now_ns())
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Multi-step error: {e}")
 
 
 @app.get("/telemetry/snapshot", response_model=TelemetrySnapshot, dependencies=[Depends(auth_guard)])
