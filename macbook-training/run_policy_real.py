@@ -57,7 +57,7 @@ def rpc_multi_step(base_url: str, servo_deltas, duration_ms: int, readback: bool
 
 def main():
     ap = argparse.ArgumentParser(description="Run PPO policy on real arm via RPC bridge.")
-    ap.add_argument("--policy", choices=["one", "two"], default=None, help="Which policy to run: one or two servo")
+    ap.add_argument("--policy", choices=["one", "two", "six"], default=None, help="Which policy to run: one, two, or six servo")
     ap.add_argument("--model", default=None, help="Optional override path to PPO .zip")
     ap.add_argument("--host", required=True, help="Raspberry Pi host/IP")
     ap.add_argument("--port", type=int, default=8000)
@@ -75,6 +75,9 @@ def main():
     ap.add_argument("--servo-off", action="store_true", help="Send servoOff after completion")
     ap.add_argument("--deterministic", action="store_true", help="Use deterministic policy actions")
     ap.add_argument("--print-every", type=int, default=10, help="How often to log iterations")
+    ap.add_argument("--servo-ids", default="3,4,5,6,2,1", help="Comma-separated servo IDs for 6-joint policy")
+    ap.add_argument("--goals", default="30,30,30,30,0,0", help="Comma-separated goals (deg) for 6-joint policy")
+    ap.add_argument("--max-deltas", default=None, help="Comma-separated max-deltas per joint for 6-joint policy; defaults to --max-delta per joint")
     args = ap.parse_args()
 
     base_url = f"http://{args.host}:{args.port}"
@@ -83,19 +86,21 @@ def main():
     policy_choice = args.policy
     if policy_choice is None:
         try:
-            sel = input("Run which policy? [1] one-servo, [2] two-servo (default 1): ").strip()
+            sel = input("Run which policy? [1] one-servo, [2] two-servo, [6] six-servo (default 1): ").strip()
         except EOFError:
             sel = "1"
-        policy_choice = "two" if sel == "2" else "one"
+        policy_choice = "six" if sel == "6" else ("two" if sel == "2" else "one")
 
     # Choose model path (allow override via --model)
     if args.model:
         model_path = args.model
     else:
-        if policy_choice == "two":
-            model_path = "macbook-training/ppo_xarm_sim_2j.zip"
+        if policy_choice == "six":
+            model_path = "ppo_xarm_sim_6j"
+        elif policy_choice == "two":
+            model_path = "ppo_xarm_sim_2j"
         else:
-            model_path = "macbook-training/ppo_xarm_sim.zip"
+            model_path = "ppo_xarm_sim"
 
     # Load PPO policy
     model = PPO.load(model_path, device="cpu")
@@ -110,7 +115,86 @@ def main():
     dt = 1.0 / max(args.hz, 0.1)
     duration_ms = max(1, int(round(dt * 1000.0)))
 
-    if policy_choice == "two":
+    def _parse_csv_ints(s):
+        return [int(x) for x in s.split(",") if x.strip() != ""]
+
+    def _parse_csv_floats(s):
+        return [float(x) for x in s.split(",") if x.strip() != ""]
+
+    if policy_choice == "six":
+        # Six-servo control using /rpc/multi_step
+        ids = _parse_csv_ints(args.servo_ids)
+        if len(ids) != 6:
+            raise ValueError(f"--servo-ids must have 6 entries, got {ids}")
+        goals = _parse_csv_floats(args.goals)
+        if len(goals) != 6:
+            raise ValueError(f"--goals must have 6 entries, got {goals}")
+        if args.max_deltas is None:
+            max_deltas = [float(args.max_delta)] * 6
+        else:
+            max_deltas = _parse_csv_floats(args.max_deltas)
+            if len(max_deltas) != 6:
+                raise ValueError(f"--max-deltas must have 6 entries, got {max_deltas}")
+
+        # initial angles
+        angles = [
+            float(
+                rpc_invoke(
+                    base_url,
+                    "getPosition",
+                    args=[sid],
+                    kwargs={"degrees": True},
+                    token=args.token,
+                )
+            )
+            for sid in ids
+        ]
+
+        # 12D obs interleaved: [angle_i, goal_i-angle_i] x 6
+        obs = np.empty(12, dtype=np.float32)
+        obs[0::2] = np.array(angles, dtype=np.float32)
+        obs[1::2] = (np.array(goals, dtype=np.float32) - obs[0::2])
+
+        print(
+            f"Start angles={[f'{a:.2f}' for a in angles]} → goals={[f'{g:.2f}' for g in goals]}, hz={args.hz}, duration_ms={duration_ms}"
+        )
+
+        for t in range(args.max_steps):
+            action, _ = model.predict(obs, deterministic=args.deterministic)
+            a = np.array(action, dtype=np.float32).reshape(-1)
+            if a.size < 6:
+                raise RuntimeError(f"Six-servo policy expects action dim=6, got {a.shape}")
+            a = np.clip(a[:6], -1.0, 1.0)
+            deltas = [float(a[i]) * float(max_deltas[i]) for i in range(6)]
+
+            servo_deltas = [[ids[i], deltas[i]] for i in range(6)]
+            angles_dict, clipped = rpc_multi_step(
+                base_url,
+                servo_deltas=servo_deltas,
+                duration_ms=duration_ms,
+                readback=True,
+                token=args.token,
+            )
+
+            # update angles from readback
+            angles = [float(angles_dict.get(ids[i], angles[i])) for i in range(6)]
+            dists = [abs(angles[i] - goals[i]) for i in range(6)]
+
+            if (t % args.print_every) == 0:
+                angles_str = ",".join(f"{x:6.2f}" for x in angles)
+                dists_str = ",".join(f"{d:5.2f}" for d in dists)
+                acts_str = ",".join(f"{x:+.3f}" for x in a)
+                dels_str = ",".join(f"{x:+.2f}" for x in deltas)
+                print(f"{t:03d} angle=[{angles_str}]°  dist=[{dists_str}]°  a=[{acts_str}]  d=[{dels_str}]")
+
+            if all(d < args.tolerance for d in dists):
+                print(f"Reached all goals within tolerance at t={t}")
+                break
+
+            # next observation
+            obs[0::2] = np.array(angles, dtype=np.float32)
+            obs[1::2] = (np.array(goals, dtype=np.float32) - obs[0::2])
+    elif policy_choice == "two":
         # Two-servo control using /rpc/multi_step
         sid1 = int(args.servo_id)
         sid2 = int(args.servo_id_2)
