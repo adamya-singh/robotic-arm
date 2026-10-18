@@ -4,6 +4,7 @@
 
 import time
 import sys
+import hid_compat
 import xarm
 
 DURATION_MS = 800  # movement duration in milliseconds
